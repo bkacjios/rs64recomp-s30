@@ -1,0 +1,171 @@
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index 2633b08..558911b 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -6,10 +6,14 @@
+ #include "recomp.h"
+ 
+ namespace recomp {
+-    // 512GB (kseg0 size)
++    // The writable part of rdram: 512MB (kseg0 size) unless the build sets RECOMP_MEM_SIZE (a device with less RAM than that can't commit it).
++#ifdef RECOMP_MEM_SIZE
++    constexpr size_t mem_size = RECOMP_MEM_SIZE;
++#else
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+-    // 4GB (the full address space); 32-bit hosts reserve only mem_size and mask guest addresses instead (RDRAM_OFFSET).
+-    constexpr size_t allocation_size = sizeof(void*) == 4 ? mem_size : (size_t)(4096ULL * 1024ULL * 1024ULL);
++#endif
++    // 4GB (the full address space); 32-bit hosts reserve only the 512MB window RDRAM_OFFSET masks guest addresses into.
++    constexpr size_t allocation_size = sizeof(void*) == 4 ? (size_t)(512ULL * 1024ULL * 1024ULL) : (size_t)(4096ULL * 1024ULL * 1024ULL);
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
+index 8765225..22fd2bf 100644
+--- a/librecomp/src/overlays.cpp
++++ b/librecomp/src/overlays.cpp
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <unordered_map>
+@@ -442,7 +443,15 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t
+     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
+ }
+ 
++extern "C" void ultramodern_preempt_point(void);
++
+ extern "C" recomp_func_t * get_function(int32_t addr) {
++    // S30_PREEMPT=1: every call is a point where a waiting higher-priority N64 thread (woken by a VI or RCP message) can run
++    static const bool s_preempt = [](){ const char* e = std::getenv("S30_PREEMPT"); return e && *e == '1'; }();
++    if (s_preempt) {
++        ultramodern_preempt_point();
++    }
++
+     auto func_find = func_map.find(addr);
+     if (func_find == func_map.end()) {
+ #ifdef _MSC_VER
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index b4119b7..36e735f 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -64,6 +64,24 @@ extern "C" int rs64_gfx_parse_inflight_wait(int ms) {
+ 
+ static ultramodern::events::callbacks_t events_callbacks{};
+ 
++// S30_TIMELINE=1: the first 1500 VI / graphics task / DP-done / swap events, with milliseconds since start (frame pacing)
++static void timeline(const char* what, uint32_t a);
++extern "C" void s30_timeline(const char* what, uint32_t a) {
++    timeline(what, a);
++}
++static void timeline(const char* what, uint32_t a) {
++    static const bool s_on = [](){ const char* e = std::getenv("S30_TIMELINE"); return e && *e == '1'; }();
++    static const auto s_t0 = std::chrono::steady_clock::now();
++    static std::atomic<int> s_n{0};
++
++    if (!s_on || s_n.fetch_add(1) >= 1500) {
++        return;
++    }
++
++    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_t0).count();
++    fprintf(stderr, "[tl] %9.2f %s %08X\n", ms, what, a);
++}
++
+ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t& callbacks) {
+     events_callbacks = callbacks;
+ }
+@@ -420,6 +438,7 @@ void vi_thread_func() {
+             ViState* cur_state = events_context.vi.get_cur_state();
+             if (remaining_retraces == 0) {
+                 if (cur_state->mq != NULLPTR) {
++                    timeline("vi-msg", (uint32_t)cur_state->retrace_count);
+                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
+                     // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next.
+                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
+@@ -449,6 +468,22 @@ void vi_thread_func() {
+     }
+ }
+ 
++// A preemption point for the recompiled code (librecomp's get_function, S30_PREEMPT): a pending VI or RCP message is delivered now and
++// a higher-priority N64 thread it wakes (the retrace handler swapping buffers) runs before this one goes on, as the N64's interrupt would
++// let it. Without it the retrace waits for the game thread to block, a whole frame's logic on a slow host, and every frame misses a VI.
++bool external_messages_pending();
++void dequeue_external_messages(RDRAM_ARG1);
++extern "C" void ultramodern_preempt_point(void) {
++    if (!external_messages_pending() || !ultramodern::is_game_thread() || events_context.rdram == nullptr) {
++        return;
++    }
++
++    uint8_t* rdram = events_context.rdram;
++    dequeue_external_messages(PASS_RDRAM1);
++    timeline("preempt", 0);
++    ultramodern::check_running_queue(PASS_RDRAM1);
++}
++
+ void sp_complete() {
+     [[maybe_unused]] uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+@@ -457,6 +492,7 @@ void sp_complete() {
+ 
+ void dp_complete() {
+     [[maybe_unused]] uint8_t* rdram = events_context.rdram;
++    timeline("dp-done", 0);
+     std::lock_guard lock{ events_context.message_mutex };
+     static const bool s_lfq = [](){ const char* e = std::getenv("ROGUESQ_LOG_FRAMEQ"); return e && *e && *e != '0'; }();
+     if (s_lfq) { static unsigned n = 0; fprintf(stderr, "[frameq] dp_complete #%u -> mq=0x%06X\n", ++n, (uint32_t)events_context.dp.mq & 0xFFFFFFu); fflush(stderr); }
+@@ -620,10 +656,15 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 // event only after the list has been parsed, as the RSP would. With the early completion the
+                 // game recycles DL chunks the HLE is still walking (phantom commands / garbage SETCIMG).
+                 static const bool s_sp_after = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); return !(e && *e == '0'); }();   // default on
+-                if (!s_sp_after) sp_complete();
++                // ROGUESQ_GFX_DONE_BEFORE_PARSE=1: SP and DP done before the parse, so the game runs its next frame's logic while this
++                // one is drawn; the parse stays in flight (g_gfx_parse_inflight) and the chunk-release hooks wait for it.
++                static const bool s_done_before = [](){ const char* e = std::getenv("ROGUESQ_GFX_DONE_BEFORE_PARSE"); return e && *e == '1'; }();
++                if (s_done_before) { sp_complete(); dp_complete(); }
++                else if (!s_sp_after) sp_complete();
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
++                timeline("gfx-task", (uint32_t)displaylist);
+                 ultramodern::extensions::on_displaylist_submitted(displaylist);
+ 
+                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+@@ -667,8 +708,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 }
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+ 
+-                if (s_sp_after) sp_complete();
+-                dp_complete();
++                if (!s_done_before) {
++                    if (s_sp_after) sp_complete();
++                    dp_complete();
++                }
+                 { std::lock_guard<std::mutex> plock{ g_gfx_parse_mutex }; if (g_gfx_parse_inflight.load(std::memory_order_acquire) > 0) g_gfx_parse_inflight.fetch_sub(1, std::memory_order_acq_rel); }
+                 g_gfx_parse_cv.notify_all();
+                 if (s_log_task) { fprintf(stderr, "[gfx-task #%u] done sp+dp signaled parse=%lld us pdl=%lld us hops=%u faces=%u req=%u inflight=%d\n", s_task_n, (long long)std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count(), g_rs64_pdl_us, g_f5_task_hops, g_f5_task_faces, g_rs64_gfx_requests, g_gfx_parse_inflight.load(std::memory_order_acquire)); fflush(stderr); }
+@@ -757,6 +800,7 @@ void set_dummy_vi(bool odd) {
+ }
+ 
+ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
++    timeline("swap", (uint32_t)frameBufPtr);
+     std::lock_guard lock{ events_context.message_mutex };
+     ViState* next_state = events_context.vi.get_next_state();
+     next_state->framebuffer = frameBufPtr;
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index ff27cd1..68247f4 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -132,6 +132,10 @@ void dequeue_external_messages(RDRAM_ARG1) {
+     }
+ }
+ 
++bool external_messages_pending() {
++    return external_messages.size_approx() != 0;
++}
++
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     external_messages.wait_dequeue(to_send);

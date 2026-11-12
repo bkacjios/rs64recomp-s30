@@ -41,6 +41,7 @@ using recomp::dbg::env_int;
 extern "C" void rs64_gfx_task_submitted(void);          // ultramodern events.cpp
 extern "C" void rs64_wait_gfx_parse(void);
 extern "C" int rs64_gfx_parse_inflight_wait(int ms);
+extern "C" void s30_timeline(const char* what, uint32_t a);  // ultramodern events.cpp
 void dequeue_external_messages(uint8_t* rdram);         // ultramodern mesgqueue.cpp, C++ linkage
 extern void print_stack_with_symbols(void** frames, unsigned short count);  // main.cpp
 
@@ -707,6 +708,7 @@ extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx)
     if (q == 0x80128CF0u && ctx->r2 == 0) {
         static unsigned s_n = 0;
         ++s_n;
+        s30_timeline("frame-start", 0);
         const int before = rs64_gfx_parse_inflight_wait(0);
         rs64_wait_gfx_parse_yield(rdram, ctx);
         static const bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK");
